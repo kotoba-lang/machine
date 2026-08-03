@@ -269,8 +269,14 @@
   must not be copied into a descriptor that something plans against."
   (assoc probed
          :tlb {:penalty-by-pages
-               {:dependent {16 1.00 128 1.00 256 1.41 512 1.73 1024 4.21 2048 5.03}
-                :streaming {32 1.00 128 1.06 512 1.26}}
+               ;; De-confounded figures. The earlier set (512 -> 1.73,
+               ;; 2048 -> 5.03) came from a probe that touched one line per
+               ;; page at offset 0, making every touched line mutually
+               ;; congruent in the cache; most of that rise was conflict, not
+               ;; translation. These are mid-range values from the staggered
+               ;; probe -- still a shape rather than a qualified measurement.
+               {:dependent {16 1.00 128 1.10 256 1.15 512 1.35 1024 1.55 2048 1.60}
+                :streaming {32 1.00 128 1.08 512 1.25}}
                :source "machine-probe tlb probe, one line per page, 2026-08-03"
                :runtime :jvm}))
 
@@ -320,9 +326,19 @@
                          {:streaming {32 1.0}})
                512 :dependent)))))
 
-(deftest the-two-regimes-are-why-this-fact-is-not-one-number
-  (testing "at the same 512 pages the walks disagree by more than 1.3x; a
-            planner handed the chase figure shrinks tiles against a cost a
-            streaming loop never pays"
-    (is (< 1.3 (/ (m/translation-penalty with-tlb 512 :dependent)
-                  (m/translation-penalty with-tlb 512 :streaming))))))
+(deftest the-regimes-are-separate-because-the-walks-are-not-the-same-walk
+  (testing "NOT because the numbers are far apart. An earlier version of this
+            test asserted a >1.3x gap at 512 pages, on a fixture whose chase
+            figures turned out to be mostly L1 conflict rather than
+            translation. De-confounded, the two overlap on this part -- 512
+            pages reads 1.17-1.55x dependent and 1.09-1.48x streaming across
+            three runs -- so the gap is not the justification and asserting one
+            would pin an artifact.
+
+            What the API owes is that asking for a regime returns THAT
+            regime's measurement or nothing, never the other one's."
+    (let [only-streaming (assoc-in with-tlb [:tlb :penalty-by-pages]
+                                   {:streaming {32 1.0 512 1.26}})]
+      (is (nil? (m/translation-penalty only-streaming 512 :dependent))
+          "a regime the machine did not measure is absent, not substituted")
+      (is (= 1.26 (m/translation-penalty only-streaming 512 :streaming))))))

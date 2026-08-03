@@ -155,12 +155,25 @@
 (def translation-regimes
   "How the walk that pays the translation cost is shaped.
 
-  These are not two estimates of one number. On the part measured here, the
-  same spread of pages costs 5x under `:dependent` and 1.36x under
-  `:streaming` — because a dependent chain has no memory-level parallelism to
-  hide a page walk behind, and a streaming walk has plenty. A planner that
-  takes the `:dependent` figure for a streaming loop will shrink tiles to
-  avoid a cost it was never going to pay, and give up cache reuse to do it."
+  A dependent chain has no memory-level parallelism to hide a page walk
+  behind; a streaming walk has plenty. That is a real difference in mechanism,
+  and it is why the fact carries a curve per regime rather than one curve.
+
+  **It is not, on this part, a large difference in magnitude — and the figure
+  that once said otherwise was an artifact.** An earlier version of the probe
+  touched one line per page at offset 0, so every touched line sat 16 KiB
+  apart and congruent to the same cache sets; the resulting 5x was mostly L1
+  conflict, not translation. De-confounded and measured across three runs, the
+  two regimes overlap at the only page count both cover: `:dependent` at 512
+  pages reads 1.17-1.55x and `:streaming` reads 1.09-1.48x.
+
+  So the reason `translation-penalty` refuses to guess is not that the numbers
+  are far apart here. It is that a machine measures the regimes separately,
+  and silently answering with one regime's curve when asked for the other
+  returns a number about a different walk. On a part where the TLB is smaller
+  relative to the working set than this one, that number could be far off; on
+  this one it happens not to be, and neither the caller nor this function
+  knows which case it is in."
   #{:dependent :streaming})
 
 (defn- tlb-errors
@@ -474,12 +487,18 @@
   "How much slower a walk gets from spreading over `pages` pages, as a ratio.
 
   Address translation is a cost the byte-counting models do not see: the same
-  bytes, the same cache pressure, spread over more pages, cost more. Measured
-  on the part this was developed against, 2048 cache lines held at a constant
-  256 KiB cost 16.8 ns per access on 16 pages and 84.5 ns on 2048 — a 5x
-  spread with the data never leaving L2. That figure came off a machine
-  running at a load average of 68 across 10 cores and has not itself passed a
-  noise gate; it is the reason this fact exists, not a number to plan against.
+  bytes, the same cache pressure, spread over more pages, cost more.
+
+  **How much more is smaller than this docstring used to claim.** It said 16.8
+  ns per access at 16 pages against 84.5 at 2048, a 5x spread. That probe put
+  every touched line at a page boundary, so the lines were mutually congruent
+  in the cache and most of the 5x was conflict rather than translation. With
+  the addresses staggered, the same sweep gives about 1.5-1.8x at 2048 pages.
+
+  The fact still earns its place -- a byte-counting model sees none of even
+  1.5x, and `traversal/pages-touched` exists because a tile's page footprint
+  is not implied by its size. But it is a modest effect on this part, not the
+  dominant one an earlier reading suggested.
 
   **The regime is not optional and has no default.** That same spread costs
   1.36x rather than 5x when the walk streams instead of chasing pointers, and

@@ -76,7 +76,14 @@
                 (not (cache-kinds kind))        (conj :invalid-cache-kind)
                 (not (pos-int? bytes))          (conj :invalid-cache-bytes)
                 (not (pow2? line-bytes))        (conj :invalid-cache-line-bytes)
-                (not (pos-int? ways))           (conj :invalid-cache-ways)
+                ;; Associativity is OPTIONAL, learned the hard way: macOS
+                ;; exposes cache sizes, line width, page size and cluster
+                ;; topology through sysctl and does NOT expose ways at all.
+                ;; A contract that demands a fact the platform will not give
+                ;; leaves a probe with two options — fabricate a plausible
+                ;; number, or refuse to describe the machine — and both are
+                ;; worse than recording that it is unknown.
+                (and (some? ways) (not (pos-int? ways))) (conj :invalid-cache-ways)
                 (not (pos-int? shared-by))      (conj :invalid-cache-shared-by)
                 (and (pos-int? bytes) (pos-int? ways) (pow2? line-bytes)
                      (not (zero? (mod bytes (* ways line-bytes)))))
@@ -93,6 +100,29 @@
         (err :cache-capacity-not-increasing
              {:kind kind :level-a (:level a) :level-b (:level b)}))))))
 
+(defn- simd-errors [simd]
+  (when simd
+    (cond-> []
+      (not (pow2? (:width-bits simd))) (conj (err :invalid-simd-width {:simd simd}))
+      (not (keyword? (:name simd)))    (conj (err :invalid-simd-name {:simd simd})))))
+
+(defn- cluster-errors [clusters]
+  (if-not (or (nil? clusters) (vector? clusters))
+    [(err :invalid-cluster-list {:clusters clusters})]
+    (vec
+     (concat
+      (for [[i c] (map-indexed vector clusters)
+            e (concat
+               (cond-> []
+                 (not (keyword? (:id c)))     (conj (err :invalid-cluster-id {:index i :cluster c}))
+                 (not (pos-int? (:cores c)))  (conj (err :invalid-cluster-cores {:index i :cluster c})))
+               (simd-errors (:simd c))
+               (cache-errors (:cache c)))]
+        e)
+      (let [ids (map :id clusters)]
+        (when-not (= (count ids) (count (set ids)))
+          [(err :duplicate-cluster-id {:ids (vec ids)})]))))))
+
 (defn- cpu-errors [cpu]
   (if (nil? cpu)
     []
@@ -100,13 +130,16 @@
      (cond-> []
        (not (keyword? (:arch cpu)))     (conj (err :invalid-cpu-arch {:arch (:arch cpu)}))
        (not (pos-int? (:cores cpu)))    (conj (err :invalid-cpu-cores {:cores (:cores cpu)})))
-     (when-let [simd (:simd cpu)]
-       (cond-> []
-         (not (pow2? (:width-bits simd)))
-         (conj (err :invalid-simd-width {:simd simd}))
-         (not (keyword? (:name simd)))
-         (conj (err :invalid-simd-name {:simd simd}))))
-     (cache-errors (:cache cpu)))))
+     (simd-errors (:simd cpu))
+     (cache-errors (:cache cpu))
+     (cluster-errors (:clusters cpu))
+     ;; A heterogeneous machine that also carries a top-level `:cache` invites
+     ;; exactly the bug the cluster model exists to prevent: a planner reads
+     ;; the flat cache, gets one cluster's numbers, and silently plans the
+     ;; wrong tile for the other. Carry one or the other.
+     (when (and (seq (:clusters cpu)) (seq (:cache cpu)))
+       [(err :both-flat-cache-and-clusters
+             {:note "a heterogeneous CPU must not also declare a flat :cache"})]))))
 
 (defn- page-errors [page]
   (when page
@@ -228,13 +261,73 @@
 ;; should say so (see `require-fact`), not quietly plan against a constant
 ;; the descriptor never claimed.
 
-(defn caches [m] (get-in m [:cpu :cache]))
+(defn clusters
+  "The CPU's performance clusters, or `nil` on a homogeneous machine.
+
+  Heterogeneous CPUs are the normal case now, not an exotic one — Apple
+  silicon, Intel hybrid, ARM DynamIQ. This machine model gained clusters the
+  first time it was pointed at a real device: an M1 Max reports 8 performance
+  cores with 128 KiB L1d and a 12 MiB L2 shared by four, alongside 2
+  efficiency cores with 64 KiB L1d and a 4 MiB L2 shared by two. A single
+  `:cpu :cache` cannot say that, and picking either set silently mis-plans for
+  the other half of the machine."
+  [m]
+  (seq (get-in m [:cpu :clusters])))
+
+(defn heterogeneous? [m] (boolean (clusters m)))
+
+(defn cluster [m id] (first (filter #(= id (:id %)) (clusters m))))
+
+(defn caches
+  "Every cache the machine declares — flat, or every cluster's on a
+  heterogeneous CPU. Correct for questions that take a maximum (line width);
+  not for questions that take a capacity, which is why those demand a
+  cluster."
+  [m]
+  (if-let [cs (clusters m)]
+    (vec (mapcat :cache cs))
+    (get-in m [:cpu :cache])))
+
+(defn for-cluster
+  "A homogeneous descriptor view of one cluster.
+
+  This is the ergonomic half of the honest answer. Asking a heterogeneous
+  machine for \"the private L2 share\" has no single answer and throws; asking
+  `(for-cluster m :performance)` has one, and every downstream planner —
+  `layout`, `traversal`, `paging` — takes it unchanged, because what it gets
+  back is an ordinary flat descriptor. Naming the cluster is the whole cost,
+  and it is the right cost: a tile sized against the efficiency cluster's L2
+  is a different tile."
+  [m id]
+  (let [c (or (cluster m id)
+              (throw (ex-info "no such cluster"
+                              {:phase :machine/for-cluster :cluster id
+                               :known (mapv :id (clusters m))})))]
+    (-> m
+        (assoc :machine/id (str (:machine/id m) "/" (name id)))
+        (assoc :cpu (cond-> {:arch (get-in m [:cpu :arch])
+                             :cores (:cores c)
+                             :cache (:cache c)}
+                      (or (:simd c) (get-in m [:cpu :simd]))
+                      (assoc :simd (or (:simd c) (get-in m [:cpu :simd]))))))))
+
+(defn- homogeneous!
+  "Refuse a capacity question that a heterogeneous machine cannot answer."
+  [m what]
+  (when (heterogeneous? m)
+    (throw (ex-info (str what " is not a single number on a heterogeneous CPU")
+                    {:phase :machine/homogeneous
+                     :machine/id (:machine/id m)
+                     :clusters (mapv :id (clusters m))
+                     :remedy "(machine.core/for-cluster m :performance) — name the cluster"})))
+  m)
 
 (defn cache-at
   "The cache record at `level` of `kind` (`:data`/`:instruction`/`:unified`).
   Falls back to `:unified` at that level when the exact kind is absent, which
   is how real hierarchies are shaped: split L1, unified L2/L3."
   [m level kind]
+  (homogeneous! m "a cache at a level")
   (let [cs (caches m)]
     (or (first (filter #(and (= level (:level %)) (= kind (:kind %))) cs))
         (first (filter #(and (= level (:level %)) (= :unified (:kind %))) cs)))))
@@ -257,6 +350,7 @@
   against the raw shared capacity is the classic way to produce a tile that
   fits on paper and thrashes with three sibling threads."
   [m level kind]
+  (homogeneous! m "a private cache share")
   (when-let [c (cache-at m level kind)]
     (quot (:bytes c) (:shared-by c))))
 

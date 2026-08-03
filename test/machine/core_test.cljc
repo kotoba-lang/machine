@@ -148,3 +148,63 @@
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (m/validate! broken)))
     (is (<= 2 (count (m/validation-errors broken))))))
+
+;; ── heterogeneous CPUs (added 2026-08-03 after first contact with an M1 Max) ──
+
+(def ^:private hetero
+  {:format m/format-id
+   :machine/id "p+e"
+   :machine/provenance :measured
+   :machine/source "test fixture"
+   :cpu {:arch :aarch64 :cores 10
+         :simd {:name :neon :width-bits 128}
+         :clusters [{:id :performance :cores 8
+                     :cache [{:level 1 :kind :data :bytes 131072 :line-bytes 128 :shared-by 1}
+                             {:level 2 :kind :unified :bytes 12582912 :line-bytes 128 :shared-by 4}]}
+                    {:id :efficiency :cores 2
+                     :cache [{:level 1 :kind :data :bytes 65536 :line-bytes 128 :shared-by 1}
+                             {:level 2 :kind :unified :bytes 4194304 :line-bytes 128 :shared-by 2}]}]}
+   :page {:base-bytes 16384 :huge []}})
+
+(deftest ways-are-optional-because-some-platforms-do-not-report-them
+  (testing "macOS exposes sizes, line width and topology but not associativity"
+    (is (m/valid? hetero))
+    (is (every? #(nil? (:ways %)) (m/caches hetero))))
+  (testing "a declared but nonsensical ways is still an error"
+    (is (some #(= :invalid-cache-ways (:error %))
+              (m/validation-errors (assoc-in hetero [:cpu :clusters 0 :cache 0 :ways] 0))))))
+
+(deftest a-capacity-question-with-no-single-answer-throws
+  (is (m/heterogeneous? hetero))
+  (is (= [:performance :efficiency] (mapv :id (m/clusters hetero))))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (m/private-cache-bytes hetero 2 :unified)))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (m/cache-at hetero 1 :data)))
+  (testing "but a maximum still has one, so line width answers"
+    (is (= 128 (m/line-bytes hetero)))))
+
+(deftest for-cluster-hands-back-an-ordinary-flat-descriptor
+  (let [p (m/for-cluster hetero :performance)
+        e (m/for-cluster hetero :efficiency)]
+    (is (m/valid? p))
+    (is (not (m/heterogeneous? p)))
+    (is (= "p+e/performance" (:machine/id p)))
+    (is (= 3145728 (m/private-cache-bytes p 2 :unified)))
+    (is (= 2097152 (m/private-cache-bytes e 2 :unified)))
+    (testing "the cluster inherits the CPU's SIMD when it declares none"
+      (is (= 4 (m/simd-lanes p 4))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (m/for-cluster hetero :nonexistent)))))
+
+(deftest carrying-both-a-flat-cache-and-clusters-is-refused
+  (testing "a planner would read the flat one and mis-plan for the other half"
+    (is (some #(= :both-flat-cache-and-clusters (:error %))
+              (m/validation-errors
+               (assoc-in hetero [:cpu :cache]
+                         [{:level 1 :kind :data :bytes 32768 :line-bytes 64 :shared-by 1}]))))))
+
+(deftest duplicate-cluster-ids-are-refused
+  (is (some #(= :duplicate-cluster-id (:error %))
+            (m/validation-errors
+             (assoc-in hetero [:cpu :clusters 1 :id] :performance)))))

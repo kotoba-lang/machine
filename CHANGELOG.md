@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 — 2026-08-03
+
+`:bandwidth` section and `bandwidth-at-stride`.
+
+Bandwidth is a property of the machine AND the access pattern. The same part
+measured here gives 24 GB/s to a line-strided walk, 34 at a 1 KiB stride and
+11.5 at the 16 KiB page size where the TLB gives out — a 3x spread.
+
+Documenting "pass the constant that matches your stride" did not stop the wrong
+end being used **twice** in one afternoon, once making a model predict a 1.00x
+speedup where measurement gave 2.69x. So the curve now lives in the descriptor
+and a planner reads it by stride instead of being handed a number.
+
+Same contract as every other fact here: the curve carries a `:source`, an
+empty one is refused, and a machine without a measured curve answers `nil` so
+the caller has to ask out loud rather than default. Between measured points it
+takes the nearer-lower stride and it does not extrapolate past the last one.
+
+25 tests, 80 assertions.
+
+
 ## 0.2.0 — 2026-08-03
 
 First contact with a real device (an Apple M1 Max, via the new

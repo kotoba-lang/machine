@@ -208,3 +208,43 @@
   (is (some #(= :duplicate-cluster-id (:error %))
             (m/validation-errors
              (assoc-in hetero [:cpu :clusters 1 :id] :performance)))))
+
+;; ── bandwidth is machine x access pattern ───────────────────────────────
+
+(def ^:private with-curve
+  (assoc probed :bandwidth
+         {:by-stride {128 24.1 256 29.7 512 27.6 1024 34.3
+                      4096 14.5 16384 11.5 65536 14.2}
+          :source "one f64 touched every S bytes over a 256 MiB working set"}))
+
+(deftest a-curve-needs-a-source-like-every-other-measurement
+  (is (m/valid? with-curve))
+  (is (some #(= :bandwidth-curve-needs-a-source (:error %))
+            (m/validation-errors (assoc-in with-curve [:bandwidth :source] ""))))
+  (is (some #(= :invalid-bandwidth-curve (:error %))
+            (m/validation-errors (assoc-in with-curve [:bandwidth :by-stride] {}))))
+  (is (some #(= :invalid-bandwidth-entry (:error %))
+            (m/validation-errors (assoc-in with-curve [:bandwidth :by-stride] {128 0})))))
+
+(deftest bandwidth-is-looked-up-by-stride-not-assumed
+  (testing "exact measured points"
+    (is (= 24.1 (m/bandwidth-at-stride with-curve 128)))
+    (is (= 11.5 (m/bandwidth-at-stride with-curve 16384))))
+  (testing "between points it takes the nearer-lower stride"
+    (is (= 34.3 (m/bandwidth-at-stride with-curve 2048)))
+    (is (= 14.5 (m/bandwidth-at-stride with-curve 8192))))
+  (testing "past the last measured point it does not extrapolate"
+    (is (= 14.2 (m/bandwidth-at-stride with-curve 1048576))))
+  (testing "below the first, the smallest measured stride is the closest answer"
+    (is (= 24.1 (m/bandwidth-at-stride with-curve 8)))))
+
+(deftest a-machine-without-a-measured-curve-answers-nil
+  (testing "the same contract as every other absent fact — ask out loud"
+    (is (nil? (m/bandwidth-at-stride probed 4096)))
+    (is (nil? (m/bandwidth-at-stride m/unknown 4096)))))
+
+(deftest the-spread-is-why-this-exists
+  (testing "3x between the best and worst stride on one machine; picking the
+            wrong end made a model predict 1.00x against a measured 2.69x"
+    (let [vals (vals (get-in with-curve [:bandwidth :by-stride]))]
+      (is (< 2.5 (/ (apply max vals) (apply min vals)))))))

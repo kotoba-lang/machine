@@ -47,7 +47,7 @@
 
 (def ^:private top-level-keys
   #{:format :machine/id :machine/provenance :machine/source
-    :cpu :page :tlb :numa :dram :gpu :storage})
+    :cpu :page :tlb :numa :dram :gpu :storage :bandwidth})
 
 (def ^:private required-keys #{:format :machine/id :machine/provenance :machine/source})
 
@@ -171,6 +171,20 @@
                           (range nodes))))
         (conj (err :numa-self-distance-not-minimal {:numa numa}))))))
 
+(defn- bandwidth-errors
+  "A measured bandwidth curve: stride in bytes -> bytes per nanosecond."
+  [bw]
+  (when bw
+    (let [by-stride (:by-stride bw)]
+      (cond-> []
+        (not (and (map? by-stride) (seq by-stride)))
+        (conj (err :invalid-bandwidth-curve {:bandwidth bw}))
+        (and (map? by-stride)
+             (not (every? (fn [[k v]] (and (pos-int? k) (number? v) (pos? v))) by-stride)))
+        (conj (err :invalid-bandwidth-entry {:bandwidth bw}))
+        (not (and (string? (:source bw)) (seq (:source bw))))
+        (conj (err :bandwidth-curve-needs-a-source {:bandwidth bw}))))))
+
 (defn- dram-errors [dram]
   (when dram
     (cond-> []
@@ -242,6 +256,7 @@
          (numa-errors (:numa m))
          (dram-errors (:dram m))
          (gpu-errors (:gpu m))
+         (bandwidth-errors (:bandwidth m))
          (storage-errors (:storage m))))))))
 
 (defn valid? [m] (empty? (validation-errors m)))
@@ -373,6 +388,35 @@
   [m from to]
   (when-let [row (get-in m [:numa :distance from])]
     (= (get row to) (apply min row))))
+
+(defn bandwidth-at-stride
+  "Bytes per nanosecond this machine delivers to a walk of the given stride.
+
+  **Bandwidth is a property of the machine AND the access pattern.** The same
+  part measured here gives 24 GB/s to a line-strided walk, 34 at a 1 KiB
+  stride and 11.5 at the 16 KiB page size, where the TLB gives out — a 3x
+  spread. Handing a planner the wrong end of that range is not a rounding
+  error: it made one model predict a 1.00x speedup where measurement showed
+  2.69x.
+
+  Documenting \"pass the right constant\" did not stop that happening twice, so
+  the curve lives in the descriptor and this reads it. Returns `nil` when the
+  machine carries no measured curve, which is the usual `require-fact`
+  contract — a planner must ask out loud rather than default.
+
+  Between measured points it takes the **nearer-lower** stride's figure, which
+  is the pessimistic side: real curves fall as stride grows, so rounding down
+  the stride rounds up the bandwidth only when the caller asked past the last
+  measured point, and that case returns the last (lowest) entry instead."
+  [m stride-bytes]
+  (when-let [curve (get-in m [:bandwidth :by-stride])]
+    (when (pos-int? stride-bytes)
+      (let [at-or-below (filter #(<= % stride-bytes) (keys curve))]
+        (if (seq at-or-below)
+          (get curve (apply max at-or-below))
+          ;; Below every measured stride: the smallest measured one is the
+          ;; closest thing to an answer and is not extrapolated past.
+          (get curve (apply min (keys curve))))))))
 
 (defn gpu [m] (:gpu m))
 

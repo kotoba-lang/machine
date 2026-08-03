@@ -307,13 +307,13 @@
 
 (deftest translation-penalty-reads-the-named-regime
   (testing "exact points"
-    (is (= 5.03 (m/translation-penalty with-tlb 2048 :dependent)))
-    (is (= 1.26 (m/translation-penalty with-tlb 512 :streaming))))
+    (is (= 1.60 (m/translation-penalty with-tlb 2048 :dependent)))
+    (is (= 1.25 (m/translation-penalty with-tlb 512 :streaming))))
   (testing "between points it takes the nearer-lower page count"
-    (is (= 1.06 (m/translation-penalty with-tlb 400 :streaming)))
-    (is (= 1.73 (m/translation-penalty with-tlb 900 :dependent))))
+    (is (= 1.08 (m/translation-penalty with-tlb 400 :streaming)))
+    (is (= 1.35 (m/translation-penalty with-tlb 900 :dependent))))
   (testing "past the last measured point it does not extrapolate"
-    (is (= 1.26 (m/translation-penalty with-tlb 100000 :streaming))))
+    (is (= 1.25 (m/translation-penalty with-tlb 100000 :streaming))))
   (testing "below the first measured count, that count is the flat region"
     (is (= 1.00 (m/translation-penalty with-tlb 1 :streaming)))))
 

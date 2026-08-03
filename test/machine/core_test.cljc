@@ -215,7 +215,8 @@
   (assoc probed :bandwidth
          {:by-stride {128 24.1 256 29.7 512 27.6 1024 34.3
                       4096 14.5 16384 11.5 65536 14.2}
-          :source "one f64 touched every S bytes over a 256 MiB working set"}))
+          :source "one f64 touched every S bytes over a 256 MiB working set"
+          :runtime :jvm}))
 
 (deftest a-curve-needs-a-source-like-every-other-measurement
   (is (m/valid? with-curve))
@@ -224,7 +225,10 @@
   (is (some #(= :invalid-bandwidth-curve (:error %))
             (m/validation-errors (assoc-in with-curve [:bandwidth :by-stride] {}))))
   (is (some #(= :invalid-bandwidth-entry (:error %))
-            (m/validation-errors (assoc-in with-curve [:bandwidth :by-stride] {128 0})))))
+            (m/validation-errors (assoc-in with-curve [:bandwidth :by-stride] {128 0}))))
+  (testing "and its runtime: C and the JVM disagree 4x at a short stride"
+    (is (some #(= :bandwidth-curve-needs-a-runtime (:error %))
+              (m/validation-errors (update with-curve :bandwidth dissoc :runtime))))))
 
 (deftest bandwidth-is-looked-up-by-stride-not-assumed
   (testing "exact measured points"

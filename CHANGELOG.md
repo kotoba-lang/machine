@@ -18,7 +18,12 @@ empty one is refused, and a machine without a measured curve answers `nil` so
 the caller has to ask out loud rather than default. Between measured points it
 takes the nearer-lower stride and it does not extrapolate past the last one.
 
-25 tests, 80 assertions.
+A curve is specific to the RUNTIME that measured it, not only to the machine:
+a C loop and a JVM loop on the same part disagree by 4x at a 128-byte stride
+and by under 10% at 16 KiB, differing in shape as well as scale. `:runtime` is
+required for that reason.
+
+25 tests, 81 assertions.
 
 
 ## 0.2.0 — 2026-08-03

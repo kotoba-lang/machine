@@ -183,7 +183,12 @@
              (not (every? (fn [[k v]] (and (pos-int? k) (number? v) (pos? v))) by-stride)))
         (conj (err :invalid-bandwidth-entry {:bandwidth bw}))
         (not (and (string? (:source bw)) (seq (:source bw))))
-        (conj (err :bandwidth-curve-needs-a-source {:bandwidth bw}))))))
+        (conj (err :bandwidth-curve-needs-a-source {:bandwidth bw}))
+        ;; A curve without its runtime is a curve nobody can place: the same
+        ;; machine measured from C and from the JVM differs by 4x at the
+        ;; short-stride end.
+        (not (keyword? (:runtime bw)))
+        (conj (err :bandwidth-curve-needs-a-runtime {:bandwidth bw}))))))
 
 (defn- dram-errors [dram]
   (when dram
@@ -403,6 +408,13 @@
   the curve lives in the descriptor and this reads it. Returns `nil` when the
   machine carries no measured curve, which is the usual `require-fact`
   contract — a planner must ask out loud rather than default.
+
+  **A curve is specific to the runtime that measured it, not only to the
+  machine.** On the part this was developed against, a C loop and a JVM loop
+  disagree by 4x at a 128-byte stride and by under 10% at 16 KiB, and the
+  curves differ in shape as well as scale. Record which runtime produced it —
+  `:source` and `:runtime` exist for that — and do not hand a JVM-measured
+  curve to a model of native code.
 
   Between measured points it takes the **nearer-lower** stride's figure, which
   is the pessimistic side: real curves fall as stride grows, so rounding down

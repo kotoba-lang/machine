@@ -1,0 +1,404 @@
+(ns machine.core
+  "The T5 contract: what a piece of hardware IS, as validated data.
+
+  Every hardware-shaped decision in this stack — field layout, traversal
+  order, page-cache sizing, I/O batching, GPU launch geometry — needs the
+  same handful of numbers: how wide a cache line is, how big a page is, how
+  many bytes fit in L2, how deep a device queue runs. Before this namespace
+  those numbers lived nowhere, so each planner would have had to invent its
+  own constants. Constants invented per planner is exactly how an
+  optimization fossil forms: a number that was true on the machine someone
+  measured in 2026 and silently wrong everywhere after.
+
+  So a descriptor is data, it is validated, and — this is the part that
+  matters — **it carries its own provenance**. `:measured` means someone ran
+  something on the actual device. `:vendor-declared` means it came off a
+  datasheet. `:assumed` means it is a portable floor nobody measured.
+  `perfgate` refuses to qualify a performance claim built on `:assumed`
+  numbers, which is the mechanism that stops a guess from hardening into a
+  fact.
+
+  This namespace deliberately does NOT probe. Reading `sysctl`, `cpuid`,
+  `/sys/devices/system/cpu`, `navigator.gpu.limits` or a `WGSLLanguageFeatures`
+  set is a host effect; a contract that performs effects cannot be a contract.
+  A host builds a descriptor and hands it in.
+
+  Pure `.cljc`, zero dependencies, no host objects."
+  (:require [clojure.string :as str]))
+
+(def format-id :kotoba.machine/v1)
+
+(def provenances
+  "How a descriptor's numbers were obtained. Ordered weakest-last."
+  #{:measured :vendor-declared :assumed})
+
+(def ^:private provenance-rank {:measured 2 :vendor-declared 1 :assumed 0})
+
+(defn at-least-as-strong?
+  "Is `p` at least as strong a provenance as `floor`?"
+  [p floor]
+  (>= (get provenance-rank p -1) (get provenance-rank floor 99)))
+
+;; ── shape ────────────────────────────────────────────────────────────────
+;;
+;; A descriptor is a closed map. Unknown top-level keys are an error rather
+;; than being ignored, because a typo'd `:strorage` that silently reads as
+;; "no storage devices" produces a planner that quietly stops planning.
+
+(def ^:private top-level-keys
+  #{:format :machine/id :machine/provenance :machine/source
+    :cpu :page :tlb :numa :dram :gpu :storage})
+
+(def ^:private required-keys #{:format :machine/id :machine/provenance :machine/source})
+
+(def cache-kinds #{:data :instruction :unified})
+(def seek-costs
+  "How much a device charges for a non-adjacent access.
+
+  `:none` is not a rounding of `:low`. It is the statement that reordering
+  requests to reduce seek distance buys nothing, which changes an I/O
+  planner from a sorter into a batcher."
+  #{:none :low :high})
+
+(defn- pow2? [n] (and (integer? n) (pos? n) (zero? (bit-and n (dec n)))))
+
+(defn- err [code m] (merge {:error code} m))
+
+(defn- cache-errors [caches]
+  (if-not (or (nil? caches) (vector? caches))
+    [(err :invalid-cache-list {:cache caches})]
+    (vec
+     (concat
+      (for [[i c] (map-indexed vector caches)
+            :let [{:keys [level kind bytes line-bytes ways shared-by]} c]
+            e (cond-> []
+                (not (pos-int? level))          (conj :invalid-cache-level)
+                (not (cache-kinds kind))        (conj :invalid-cache-kind)
+                (not (pos-int? bytes))          (conj :invalid-cache-bytes)
+                (not (pow2? line-bytes))        (conj :invalid-cache-line-bytes)
+                (not (pos-int? ways))           (conj :invalid-cache-ways)
+                (not (pos-int? shared-by))      (conj :invalid-cache-shared-by)
+                (and (pos-int? bytes) (pos-int? ways) (pow2? line-bytes)
+                     (not (zero? (mod bytes (* ways line-bytes)))))
+                (conj :cache-geometry-inconsistent))]
+        (err e {:index i :cache c}))
+      ;; Levels must be strictly increasing in capacity per kind. A machine
+      ;; whose L2 is smaller than its L1 is a transcription error, and every
+      ;; "does the working set fit" question downstream would answer wrongly.
+      (for [[kind group] (group-by :kind caches)
+            :let [sorted (sort-by :level group)]
+            [a b] (partition 2 1 sorted)
+            :when (and (pos-int? (:bytes a)) (pos-int? (:bytes b))
+                       (>= (:bytes a) (:bytes b)))]
+        (err :cache-capacity-not-increasing
+             {:kind kind :level-a (:level a) :level-b (:level b)}))))))
+
+(defn- cpu-errors [cpu]
+  (if (nil? cpu)
+    []
+    (concat
+     (cond-> []
+       (not (keyword? (:arch cpu)))     (conj (err :invalid-cpu-arch {:arch (:arch cpu)}))
+       (not (pos-int? (:cores cpu)))    (conj (err :invalid-cpu-cores {:cores (:cores cpu)})))
+     (when-let [simd (:simd cpu)]
+       (cond-> []
+         (not (pow2? (:width-bits simd)))
+         (conj (err :invalid-simd-width {:simd simd}))
+         (not (keyword? (:name simd)))
+         (conj (err :invalid-simd-name {:simd simd}))))
+     (cache-errors (:cache cpu)))))
+
+(defn- page-errors [page]
+  (when page
+    (cond-> []
+      (not (pow2? (:base-bytes page)))
+      (conj (err :invalid-page-base-bytes {:page page}))
+      (not (and (vector? (:huge page)) (every? pow2? (:huge page))))
+      (conj (err :invalid-huge-pages {:page page}))
+      (and (pow2? (:base-bytes page)) (vector? (:huge page))
+           (not (every? #(and (pow2? %) (> % (:base-bytes page))) (:huge page))))
+      (conj (err :huge-page-not-larger-than-base {:page page})))))
+
+(defn- numa-errors [numa]
+  (when numa
+    (let [{:keys [nodes distance]} numa]
+      (cond-> []
+        (not (pos-int? nodes))
+        (conj (err :invalid-numa-nodes {:numa numa}))
+        (not (and (vector? distance)
+                  (= nodes (count distance))
+                  (every? #(and (vector? %) (= nodes (count %))
+                                (every? pos-int? %)) distance)))
+        (conj (err :invalid-numa-distance-matrix {:numa numa}))
+        ;; A node is never further from itself than from a peer. Violating
+        ;; this inverts every placement decision built on the matrix.
+        (and (vector? distance) (= nodes (count distance))
+             (not (every? (fn [i] (= (get-in distance [i i])
+                                     (apply min (get distance i))))
+                          (range nodes))))
+        (conj (err :numa-self-distance-not-minimal {:numa numa}))))))
+
+(defn- dram-errors [dram]
+  (when dram
+    (cond-> []
+      (not (pos-int? (:channels dram)))  (conj (err :invalid-dram-channels {:dram dram}))
+      (not (pow2? (:row-bytes dram)))    (conj (err :invalid-dram-row-bytes {:dram dram})))))
+
+(defn- gpu-errors [gpu]
+  (when gpu
+    (cond-> []
+      (not (keyword? (:kind gpu)))
+      (conj (err :invalid-gpu-kind {:gpu gpu}))
+      (not (pow2? (:max-workgroup gpu)))
+      (conj (err :invalid-gpu-max-workgroup {:gpu gpu}))
+      (not (pow2? (:subgroup gpu)))
+      (conj (err :invalid-gpu-subgroup {:gpu gpu}))
+      (not (pos-int? (:shared-bytes gpu)))
+      (conj (err :invalid-gpu-shared-bytes {:gpu gpu}))
+      (and (pow2? (:max-workgroup gpu)) (pow2? (:subgroup gpu))
+           (< (:max-workgroup gpu) (:subgroup gpu)))
+      (conj (err :gpu-workgroup-smaller-than-subgroup {:gpu gpu})))))
+
+(defn- storage-errors [devices]
+  (if-not (or (nil? devices) (vector? devices))
+    [(err :invalid-storage-list {:storage devices})]
+    (vec
+     (concat
+      (for [[i d] (map-indexed vector devices)
+            e (cond-> []
+                (not (keyword? (:id d)))                  (conj :invalid-storage-id)
+                (not (keyword? (:kind d)))                (conj :invalid-storage-kind)
+                (not (pow2? (:block-bytes d)))            (conj :invalid-storage-block-bytes)
+                (not (pos-int? (:queue-depth d)))         (conj :invalid-storage-queue-depth)
+                (not (seek-costs (:seek-cost d)))         (conj :invalid-storage-seek-cost)
+                (not (pos-int? (:max-transfer-bytes d)))  (conj :invalid-storage-max-transfer-bytes)
+                (and (pow2? (:block-bytes d)) (pos-int? (:max-transfer-bytes d))
+                     (< (:max-transfer-bytes d) (:block-bytes d)))
+                (conj :storage-transfer-smaller-than-block))]
+        (err e {:index i :device d}))
+      (let [ids (map :id devices)]
+        (when-not (= (count ids) (count (set ids)))
+          [(err :duplicate-storage-id {:ids (vec ids)})]))))))
+
+(defn validation-errors
+  "Every reason `m` is not a valid machine descriptor, as a vector of maps.
+
+  Returns all errors rather than the first, because a descriptor is usually
+  hand-written once and the useful output is the whole list."
+  [m]
+  (vec
+   (remove nil?
+     (concat
+      (when-not (map? m) [(err :not-a-map {:value m})])
+      (when (map? m)
+        (concat
+         (when-not (= format-id (:format m))
+           [(err :invalid-format {:format (:format m)})])
+         (for [k (sort (remove top-level-keys (keys m)))]
+           (err :unknown-key {:key k}))
+         (for [k (sort (remove (set (keys m)) required-keys))]
+           (err :missing-required-key {:key k}))
+         (when-not (and (string? (:machine/id m)) (seq (:machine/id m)))
+           [(err :invalid-machine-id {:machine/id (:machine/id m)})])
+         (when-not (provenances (:machine/provenance m))
+           [(err :invalid-provenance {:machine/provenance (:machine/provenance m)})])
+         (when-not (and (string? (:machine/source m)) (seq (:machine/source m)))
+           [(err :invalid-source {:machine/source (:machine/source m)})])
+         (cpu-errors (:cpu m))
+         (page-errors (:page m))
+         (numa-errors (:numa m))
+         (dram-errors (:dram m))
+         (gpu-errors (:gpu m))
+         (storage-errors (:storage m))))))))
+
+(defn valid? [m] (empty? (validation-errors m)))
+
+(defn validate!
+  [m]
+  (let [errors (validation-errors m)]
+    (when (seq errors)
+      (throw (ex-info "invalid machine descriptor"
+                      {:phase :machine/validate :errors errors})))
+    m))
+
+;; ── derived facts ────────────────────────────────────────────────────────
+;;
+;; Every accessor here answers `nil` for an absent section rather than
+;; substituting a default. A planner that needs a number it was not given
+;; should say so (see `require-fact`), not quietly plan against a constant
+;; the descriptor never claimed.
+
+(defn caches [m] (get-in m [:cpu :cache]))
+
+(defn cache-at
+  "The cache record at `level` of `kind` (`:data`/`:instruction`/`:unified`).
+  Falls back to `:unified` at that level when the exact kind is absent, which
+  is how real hierarchies are shaped: split L1, unified L2/L3."
+  [m level kind]
+  (let [cs (caches m)]
+    (or (first (filter #(and (= level (:level %)) (= kind (:kind %))) cs))
+        (first (filter #(and (= level (:level %)) (= :unified (:kind %))) cs)))))
+
+(defn line-bytes
+  "The cache line width to plan against.
+
+  The MAXIMUM declared line, not the L1 line. Padding to the widest line is
+  correct at every level; padding to a narrower one leaves false sharing on
+  the level that has a wider line."
+  [m]
+  (when-let [ls (seq (keep :line-bytes (caches m)))] (apply max ls)))
+
+(defn cache-bytes [m level kind] (:bytes (cache-at m level kind)))
+
+(defn private-cache-bytes
+  "Bytes of level-`level` cache a single core may assume it owns.
+
+  Capacity divided by how many cores share it. Blocking a working set
+  against the raw shared capacity is the classic way to produce a tile that
+  fits on paper and thrashes with three sibling threads."
+  [m level kind]
+  (when-let [c (cache-at m level kind)]
+    (quot (:bytes c) (:shared-by c))))
+
+(defn page-bytes [m] (get-in m [:page :base-bytes]))
+(defn huge-page-bytes [m] (get-in m [:page :huge]))
+
+(defn simd-lanes
+  "How many `element-bytes`-wide elements fit in one SIMD register."
+  [m element-bytes]
+  (when-let [w (get-in m [:cpu :simd :width-bits])]
+    (when (pos-int? element-bytes)
+      (quot (quot w 8) element-bytes))))
+
+(defn numa-nodes [m] (get-in m [:numa :nodes]))
+
+(defn numa-distance [m from to] (get-in m [:numa :distance from to]))
+
+(defn numa-local?
+  "Is `to` the closest node to `from`? True on a single-node machine."
+  [m from to]
+  (when-let [row (get-in m [:numa :distance from])]
+    (= (get row to) (apply min row))))
+
+(defn gpu [m] (:gpu m))
+
+(defn storage-device [m id] (first (filter #(= id (:id %)) (:storage m))))
+
+(defn reorderable?
+  "Does reordering requests to this device reduce cost?
+
+  False for `:seek-cost :none` — on an NVMe/SSD an elevator sort spends CPU
+  and latency to buy nothing, and destroys the submission order the caller
+  chose."
+  [device]
+  (boolean (#{:low :high} (:seek-cost device))))
+
+(defn require-fact
+  "`(get-in m path)`, but throws when the descriptor does not carry it.
+
+  The point is that a planner asks out loud. `(or (line-bytes m) 64)` is how
+  a fossil gets in; this is the alternative."
+  [m path what]
+  (let [v (get-in m path)]
+    (when (nil? v)
+      (throw (ex-info (str "machine descriptor does not declare " what)
+                      {:phase :machine/require-fact
+                       :machine/id (:machine/id m) :path (vec path) :what what})))
+    v))
+
+;; ── canonical form and fingerprint ───────────────────────────────────────
+
+(defn- canonical-string* [x sb]
+  (cond
+    (map? x)     (do (sb "{")
+                     (doseq [[k v] (sort-by (comp pr-str key) x)]
+                       (canonical-string* k sb) (sb " ") (canonical-string* v sb) (sb ","))
+                     (sb "}"))
+    (set? x)     (do (sb "#{")
+                     (doseq [v (sort-by pr-str x)] (canonical-string* v sb) (sb ","))
+                     (sb "}"))
+    (sequential? x) (do (sb "[")
+                        (doseq [v x] (canonical-string* v sb) (sb ","))
+                        (sb "]"))
+    :else        (sb (pr-str x))))
+
+(defn canonical-string
+  "A deterministic textual rendering: map keys sorted, sets sorted, vectors
+  in order. Two descriptors that differ anywhere render differently, and the
+  same descriptor renders identically on JVM and JS."
+  [m]
+  (let [acc (volatile! [])]
+    (canonical-string* m #(vswap! acc conj %))
+    (str/join @acc)))
+
+(def ^:private fnv-prime 131)
+(def ^:private modulus 2147483647)   ; 2^31-1
+
+(defn fingerprint
+  "A deterministic 31-bit fingerprint of a descriptor.
+
+  NOT cryptographic and not claimed to be: it exists so a performance claim
+  can notice that the machine underneath it changed
+  (`perfgate/stale-on?`). Sealing an artifact is `kotoba-lang/artifact`'s
+  job. Arithmetic is chosen to stay under 2^53 so JVM longs and JS doubles
+  agree exactly — no BigInt, no host hash."
+  [m]
+  ;; `reduce` over a string yields Characters on JVM and single-char strings
+  ;; in cljs, so the code-point read is the one thing that must branch.
+  (reduce (fn [h c]
+            (mod (+ (* h fnv-prime)
+                    #?(:clj (int c) :cljs (.charCodeAt c 0)))
+                 modulus))
+          2166136261
+          (canonical-string m)))
+
+;; ── profiles ─────────────────────────────────────────────────────────────
+;;
+;; Only two, and neither pretends to be a specific product. Shipping a
+;; hardcoded "apple-m4" full of numbers nobody in this repo measured would
+;; create precisely the fossil this contract exists to prevent — and the
+;; provenance field would have to say `:assumed` while the id said otherwise.
+;; Real machines come from a host probe at `:measured`.
+
+(def portable-64
+  "A conservative floor: 64-byte lines, 4 KiB pages, one NUMA node.
+
+  Every number is the WEAKEST common value across mainstream 64-bit targets,
+  so a plan built on it is safe (if unambitious) anywhere. Marked `:assumed`,
+  which means `perfgate` will not qualify a claim measured against it."
+  {:format format-id
+   :machine/id "portable-64"
+   :machine/provenance :assumed
+   :machine/source "conservative floor across mainstream 64-bit targets; not measured"
+   :cpu {:arch :portable-64
+         :cores 1
+         :simd {:name :none :width-bits 64}
+         :cache [{:level 1 :kind :data :bytes 32768 :line-bytes 64 :ways 8 :shared-by 1}
+                 {:level 2 :kind :unified :bytes 262144 :line-bytes 64 :ways 8 :shared-by 1}]}
+   :page {:base-bytes 4096 :huge []}
+   :numa {:nodes 1 :distance [[10]]}})
+
+(def unknown
+  "A machine nothing is known about.
+
+  Valid, so it can be threaded through a pipeline, but carries no `:cpu`,
+  `:page`, `:gpu` or `:storage` — so every planner that needs a real number
+  fails loudly at `require-fact` instead of inventing one. This is the right
+  default for a host that has not probed yet."
+  {:format format-id
+   :machine/id "unknown"
+   :machine/provenance :assumed
+   :machine/source "no probe performed"})
+
+(defn measured
+  "Stamp a host-probed descriptor as `:measured` with its evidence.
+
+  `source` must say what was actually read — `\"sysctl hw.cachelinesize\"`,
+  `\"navigator.gpu.limits\"`, `\"/sys/devices/system/cpu/cpu0/cache\"`. A
+  provenance without a source is a provenance nobody can check, so this
+  refuses an empty one."
+  [m source]
+  (when-not (and (string? source) (seq source))
+    (throw (ex-info "measured descriptor needs a non-empty source"
+                    {:phase :machine/measured :machine/id (:machine/id m)})))
+  (validate! (assoc m :machine/provenance :measured :machine/source source)))

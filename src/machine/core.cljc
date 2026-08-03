@@ -477,7 +477,9 @@
   bytes, the same cache pressure, spread over more pages, cost more. Measured
   on the part this was developed against, 2048 cache lines held at a constant
   256 KiB cost 16.8 ns per access on 16 pages and 84.5 ns on 2048 — a 5x
-  spread with the data never leaving L2.
+  spread with the data never leaving L2. That figure came off a machine
+  running at a load average of 68 across 10 cores and has not itself passed a
+  noise gate; it is the reason this fact exists, not a number to plan against.
 
   **The regime is not optional and has no default.** That same spread costs
   1.36x rather than 5x when the walk streams instead of chasing pointers, and

@@ -256,8 +256,17 @@
 ;; ── translation (TLB) ────────────────────────────────────────────────────
 
 (def ^:private with-tlb
-  "Measured on Apple M1 Max via the JVM, 2026-08-03. Both curves come from the
-  same afternoon on the same part; they differ because the walks differ."
+  "Apple M1 Max via the JVM, 2026-08-03. Both curves come from the same
+  afternoon on the same part; they differ because the walks differ.
+
+  **These are a plausible shape, not a qualified measurement.** They were
+  taken with min-of-N on a machine running at a load average of 68 across 10
+  cores, and never passed a noise gate. When machine-probe's `:tlb` CLI was
+  later built to reproduce them it refused outright -- every arm sat at
+  0.44-1.54 relative stdev against an allowed 0.10, and taking the min per
+  batch instead only got that to 0.22-0.49. So they are fine for exercising
+  the validation and the accessor, which is all this fixture is for, and they
+  must not be copied into a descriptor that something plans against."
   (assoc probed
          :tlb {:penalty-by-pages
                {:dependent {16 1.00 128 1.00 256 1.41 512 1.73 1024 4.21 2048 5.03}

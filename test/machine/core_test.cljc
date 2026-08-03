@@ -252,3 +252,68 @@
             wrong end made a model predict 1.00x against a measured 2.69x"
     (let [vals (vals (get-in with-curve [:bandwidth :by-stride]))]
       (is (< 2.5 (/ (apply max vals) (apply min vals)))))))
+
+;; ── translation (TLB) ────────────────────────────────────────────────────
+
+(def ^:private with-tlb
+  "Measured on Apple M1 Max via the JVM, 2026-08-03. Both curves come from the
+  same afternoon on the same part; they differ because the walks differ."
+  (assoc probed
+         :tlb {:penalty-by-pages
+               {:dependent {16 1.00 128 1.00 256 1.41 512 1.73 1024 4.21 2048 5.03}
+                :streaming {32 1.00 128 1.06 512 1.26}}
+               :source "machine-probe tlb probe, one line per page, 2026-08-03"
+               :runtime :jvm}))
+
+(deftest a-measured-translation-curve-is-valid
+  (is (m/valid? with-tlb)))
+
+(deftest a-translation-curve-must-say-which-runtime-and-source-measured-it
+  (testing "same contract as the bandwidth curve, for the same reason"
+    (is (not (m/valid? (assoc-in with-tlb [:tlb :runtime] nil))))
+    (is (not (m/valid? (assoc-in with-tlb [:tlb :source] ""))))))
+
+(deftest a-penalty-below-one-is-rejected-rather-than-smoothed
+  (testing "touching more pages does not make a walk faster; a curve that says
+            so is a broken measurement, and silently clamping it would hide that"
+    (is (not (m/valid? (assoc-in with-tlb [:tlb :penalty-by-pages :streaming]
+                                 {32 1.0 512 0.8}))))))
+
+(deftest an-unknown-regime-is-rejected-at-both-ends
+  (testing "in the descriptor"
+    (is (not (m/valid? (assoc-in with-tlb [:tlb :penalty-by-pages :guessed]
+                                 {32 1.0})))))
+  (testing "and at the accessor, which throws rather than defaulting — a silent
+            fallback between these two regimes is a 4x error"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                 (m/translation-penalty with-tlb 512 :whatever)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                 (m/translation-penalty with-tlb 512 nil)))))
+
+(deftest translation-penalty-reads-the-named-regime
+  (testing "exact points"
+    (is (= 5.03 (m/translation-penalty with-tlb 2048 :dependent)))
+    (is (= 1.26 (m/translation-penalty with-tlb 512 :streaming))))
+  (testing "between points it takes the nearer-lower page count"
+    (is (= 1.06 (m/translation-penalty with-tlb 400 :streaming)))
+    (is (= 1.73 (m/translation-penalty with-tlb 900 :dependent))))
+  (testing "past the last measured point it does not extrapolate"
+    (is (= 1.26 (m/translation-penalty with-tlb 100000 :streaming))))
+  (testing "below the first measured count, that count is the flat region"
+    (is (= 1.00 (m/translation-penalty with-tlb 1 :streaming)))))
+
+(deftest a-machine-without-a-measured-translation-curve-answers-nil
+  (is (nil? (m/translation-penalty probed 512 :streaming)))
+  (is (nil? (m/translation-penalty m/unknown 512 :dependent)))
+  (testing "and a regime the machine did not measure is absent, not zero"
+    (is (nil? (m/translation-penalty
+               (assoc-in with-tlb [:tlb :penalty-by-pages]
+                         {:streaming {32 1.0}})
+               512 :dependent)))))
+
+(deftest the-two-regimes-are-why-this-fact-is-not-one-number
+  (testing "at the same 512 pages the walks disagree by more than 1.3x; a
+            planner handed the chase figure shrinks tiles against a cost a
+            streaming loop never pays"
+    (is (< 1.3 (/ (m/translation-penalty with-tlb 512 :dependent)
+                  (m/translation-penalty with-tlb 512 :streaming))))))

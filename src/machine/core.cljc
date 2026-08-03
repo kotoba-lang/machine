@@ -152,6 +152,45 @@
            (not (every? #(and (pow2? %) (> % (:base-bytes page))) (:huge page))))
       (conj (err :huge-page-not-larger-than-base {:page page})))))
 
+(def translation-regimes
+  "How the walk that pays the translation cost is shaped.
+
+  These are not two estimates of one number. On the part measured here, the
+  same spread of pages costs 5x under `:dependent` and 1.36x under
+  `:streaming` — because a dependent chain has no memory-level parallelism to
+  hide a page walk behind, and a streaming walk has plenty. A planner that
+  takes the `:dependent` figure for a streaming loop will shrink tiles to
+  avoid a cost it was never going to pay, and give up cache reuse to do it."
+  #{:dependent :streaming})
+
+(defn- tlb-errors
+  "Measured translation penalty: pages touched -> slowdown vs the flat region.
+
+  Values are ratios, not times, so the fact survives a machine getting
+  faster. A ratio below 1.0 means touching more pages made it quicker, which
+  is not a thing, so it is rejected rather than smoothed."
+  [tlb]
+  (when tlb
+    (let [by-regime (:penalty-by-pages tlb)
+          curve-ok? (fn [c] (and (map? c) (seq c)
+                                 (every? (fn [[k v]] (and (pos-int? k) (number? v) (>= v 1.0)))
+                                         c)))]
+      (cond-> []
+        (not (and (map? by-regime) (seq by-regime)))
+        (conj (err :invalid-tlb-curve {:tlb tlb}))
+        (and (map? by-regime)
+             (not (every? translation-regimes (keys by-regime))))
+        (conj (err :unknown-translation-regime
+                   {:tlb tlb :known translation-regimes}))
+        (and (map? by-regime) (not (every? curve-ok? (vals by-regime))))
+        (conj (err :invalid-tlb-entry {:tlb tlb}))
+        (not (and (string? (:source tlb)) (seq (:source tlb))))
+        (conj (err :tlb-curve-needs-a-source {:tlb tlb}))
+        ;; Same reason bandwidth carries one: a translation curve measured
+        ;; from the JVM does not describe native code on the same silicon.
+        (not (keyword? (:runtime tlb)))
+        (conj (err :tlb-curve-needs-a-runtime {:tlb tlb}))))))
+
 (defn- numa-errors [numa]
   (when numa
     (let [{:keys [nodes distance]} numa]
@@ -258,6 +297,7 @@
            [(err :invalid-source {:machine/source (:machine/source m)})])
          (cpu-errors (:cpu m))
          (page-errors (:page m))
+         (tlb-errors (:tlb m))
          (numa-errors (:numa m))
          (dram-errors (:dram m))
          (gpu-errors (:gpu m))
@@ -428,6 +468,44 @@
           (get curve (apply max at-or-below))
           ;; Below every measured stride: the smallest measured one is the
           ;; closest thing to an answer and is not extrapolated past.
+          (get curve (apply min (keys curve))))))))
+
+(defn translation-penalty
+  "How much slower a walk gets from spreading over `pages` pages, as a ratio.
+
+  Address translation is a cost the byte-counting models do not see: the same
+  bytes, the same cache pressure, spread over more pages, cost more. Measured
+  on the part this was developed against, 2048 cache lines held at a constant
+  256 KiB cost 16.8 ns per access on 16 pages and 84.5 ns on 2048 — a 5x
+  spread with the data never leaving L2.
+
+  **The regime is not optional and has no default.** That same spread costs
+  1.36x rather than 5x when the walk streams instead of chasing pointers, and
+  the gap is the whole point of the fact: a planner handed the pointer-chase
+  figure will size tiles against a cost a streaming loop never pays. Callers
+  name `:dependent` or `:streaming`; an unknown regime throws rather than
+  falling back, because a silent fallback here is a 4x error.
+
+  Returns `nil` when the machine carries no measured curve for that regime —
+  the usual `require-fact` contract, where a planner must ask out loud.
+
+  Between measured points it takes the **nearer-lower** page count, which is
+  the optimistic side: penalty rises with pages, so a caller sitting between
+  two measurements is told the cheaper of the two. That is deliberate — this
+  number's job is to warn about a real cost, and rounding it up would let it
+  veto tiles on evidence that was never measured."
+  [m pages regime]
+  (when-not (translation-regimes regime)
+    (throw (ex-info "unknown translation regime"
+                    {:phase :machine/translation-penalty
+                     :regime regime :known translation-regimes})))
+  (when-let [curve (get-in m [:tlb :penalty-by-pages regime])]
+    (when (pos-int? pages)
+      (let [at-or-below (filter #(<= % pages) (keys curve))]
+        (if (seq at-or-below)
+          (get curve (apply max at-or-below))
+          ;; Below every measured point: the smallest measured count is the
+          ;; flat region, which is exactly 1.0 by construction.
           (get curve (apply min (keys curve))))))))
 
 (defn gpu [m] (:gpu m))

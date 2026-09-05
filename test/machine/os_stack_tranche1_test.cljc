@@ -1,6 +1,7 @@
 (ns machine.os-stack-tranche1-test
   (:require [clojure.test :refer [deftest is]]
-            [clojure.edn :as edn]
+            #?@(:clj [[clojure.edn :as edn]
+                      [clojure.java.io :as io]])
             [machine.core :as m]))
 
 ;; ADR-2809050100 gap-2 tranche 1: the five reference devices (UEFI system
@@ -8,9 +9,10 @@
 ;; machine descriptors. A device is "supported" only when its descriptor
 ;; passes validation — these tests keep that true.
 
-(def specs
-  (edn/read-string
-   (slurp "resources/machine/profiles/os-stack-tranche1.edn")))
+#?(:clj
+   (def specs
+     (edn/read-string
+      (slurp (io/resource "machine/profiles/os-stack-tranche1.edn")))))
 
 (deftest all-descriptors-validate
   (doseq [s specs]

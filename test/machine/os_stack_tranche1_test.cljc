@@ -23,19 +23,22 @@
   (is (= (count specs) (count (set (map :machine/id specs))))))
 
 (deftest provenance-is-never-fabricated
-  ;; Nothing here is :measured — no host probe has run. A future tranche
-  ;; flips a value to :measured only with a real :machine/source.
+  ;; :measured requires a real probe source (the 2026-09-05 wifi probe has
+  ;; one: system_profiler SPAirPortDataType). Everything else is spec-derived.
   (doseq [s specs
           :let [d (:descriptor s)]]
-    (is (contains? #{:vendor-declared :assumed} (:machine/provenance d)))
-    (is (seq (:machine/source d)))))
+    (is (contains? #{:vendor-declared :assumed :measured} (:machine/provenance d)))
+    (is (seq (:machine/source d)))
+    (when (= :measured (:machine/provenance d))
+      (is (re-find #"(?i)probe|sysctl|/sys/|system_profiler" (:machine/source d))
+          ":measured provenance must cite an actual probe command"))))
 
 (deftest nvme-is-not-reorderable-but-wifi-is
   ;; The ioplan split the OS stack depends on: elevator sort harmful on
   ;; NVMe, useful on a Wi-Fi link where radio time varies.
   (let [by-id (into {} (map (juxt :machine/id :descriptor) specs))]
     (is (false? (m/reorderable? (m/storage-device (by-id "reference-x86-64-nvme") :nvme0))))
-    (is (true? (m/reorderable? (m/storage-device (by-id "reference-x86-64-wifi-11ax") :wifi0))))))
+    (is (true? (m/reorderable? (m/storage-device (by-id "probe-broadcom-4387-wifi-11ax") :wifi0))))))
 
 (deftest uefi-partition-block-smaller-than-nvme
   ;; EFI System Partition is 512B logical; NVMe is 4KiB. A boot loader

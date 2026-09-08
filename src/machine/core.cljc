@@ -24,7 +24,7 @@
   A host builds a descriptor and hands it in.
 
   Pure `.cljc`, zero dependencies, no host objects."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def format-id :kotoba.machine/v1)
 

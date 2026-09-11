@@ -109,7 +109,7 @@ BigInt, no host hash function.
 ## Test
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 Pure `.cljc`, zero production dependencies, no host objects. See

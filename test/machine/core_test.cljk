@@ -1,5 +1,5 @@
 (ns machine.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [machine.core :as m]))
 
 (def ^:private probed

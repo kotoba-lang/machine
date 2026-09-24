@@ -1,6 +1,6 @@
 (ns machine.os-stack-tranche1-test
   (:require [kotoba.test :refer [deftest is]]
-            #?@(:clj [[clojure.edn :as edn]
+            #?@(:clj [[kotoba.lang.edn :as edn]
                       [clojure.java.io :as io]])
             [machine.core :as m]))
 

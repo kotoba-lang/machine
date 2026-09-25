@@ -1,7 +1,7 @@
 (ns machine.os-stack-tranche1-test
   (:require [kotoba.test :refer [deftest is]]
             #?@(:clj [[kotoba.lang.edn :as edn]
-                      [clojure.java.io :as io]])
+                      [kotoba.io :as io]])
             [machine.core :as m]))
 
 ;; ADR-2809050100 gap-2 tranche 1: the five reference devices (UEFI system

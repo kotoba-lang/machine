@@ -35,7 +35,7 @@
     (is (nil? (m/page-bytes m/unknown)))
     (is (nil? (m/gpu m/unknown))))
   (testing "and a planner that needs the number fails loudly"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (m/require-fact m/unknown [:cpu :cache] "a cache hierarchy")))))
 
 (deftest closed-keys
@@ -129,7 +129,7 @@
   (let [stamped (m/measured m/portable-64 "sysctl hw.cachelinesize")]
     (is (= :measured (:machine/provenance stamped)))
     (is (= "sysctl hw.cachelinesize" (:machine/source stamped))))
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (m/measured m/portable-64 ""))))
 
 (deftest fingerprint-is-deterministic-and-sensitive
@@ -145,7 +145,7 @@
 
 (deftest validate-throws-with-the-whole-error-list
   (let [broken (-> probed (dissoc :machine/source) (assoc :nonsense 1))]
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (m/validate! broken)))
     (is (<= 2 (count (m/validation-errors broken))))))
 
@@ -177,9 +177,9 @@
 (deftest a-capacity-question-with-no-single-answer-throws
   (is (m/heterogeneous? hetero))
   (is (= [:performance :efficiency] (mapv :id (m/clusters hetero))))
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (m/private-cache-bytes hetero 2 :unified)))
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+  (is (thrown? js/Error
                (m/cache-at hetero 1 :data)))
   (testing "but a maximum still has one, so line width answers"
     (is (= 128 (m/line-bytes hetero)))))
@@ -194,7 +194,7 @@
     (is (= 2097152 (m/private-cache-bytes e 2 :unified)))
     (testing "the cluster inherits the CPU's SIMD when it declares none"
       (is (= 4 (m/simd-lanes p 4))))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+    (is (thrown? js/Error
                  (m/for-cluster hetero :nonexistent)))))
 
 (deftest carrying-both-a-flat-cache-and-clusters-is-refused
@@ -300,9 +300,9 @@
                                  {32 1.0})))))
   (testing "and at the accessor, which throws rather than defaulting — a silent
             fallback between these two regimes is a 4x error"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+    (is (thrown? :default
                  (m/translation-penalty with-tlb 512 :whatever)))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+    (is (thrown? :default
                  (m/translation-penalty with-tlb 512 nil)))))
 
 (deftest translation-penalty-reads-the-named-regime
